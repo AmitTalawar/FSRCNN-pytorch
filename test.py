@@ -32,13 +32,13 @@ if __name__ == '__main__':
 
     image = pil_image.open(args.image_file).convert('RGB')
 
-    image_width = (image.width // args.scale) * args.scale
-    image_height = (image.height // args.scale) * args.scale
+    image_width = (image.width) * args.scale
+    image_height = (image.height) * args.scale
 
     hr = image.resize((image_width, image_height), resample=pil_image.BICUBIC)
     lr = hr.resize((hr.width // args.scale, hr.height // args.scale), resample=pil_image.BICUBIC)
     bicubic = lr.resize((lr.width * args.scale, lr.height * args.scale), resample=pil_image.BICUBIC)
-    bicubic.save(args.image_file.replace('.', '_bicubic_x{}.'.format(args.scale)))
+    # bicubic.save(args.image_file.replace('.', '_bicubic_x{}.'.format(args.scale)))
 
     lr, _ = preprocess(lr, device)
     hr, _ = preprocess(hr, device)
