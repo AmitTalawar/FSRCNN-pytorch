@@ -6,3 +6,7 @@ setuptools
 torchvision
 Pillow
 natsort
+onnx
+onnxruntime
+matplotlib
+ffmpeg-python
