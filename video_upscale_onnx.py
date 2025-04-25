@@ -16,39 +16,43 @@ import lpips
 from utils import convert_ycbcr_to_rgb, preprocess
 
 
-def calculate_metrics(original, upscaled, device='cpu'):
+def calculate_metrics(original, compared, device='cpu'):
     """
-    Calculate image quality metrics between original and upscaled images
+    Calculate image quality metrics between original and compared images
     
     Args:
         original: Original image (numpy array)
-        upscaled: Upscaled image (numpy array)
+        compared: Image to compare against original (numpy array)
         device: Device to run LPIPS on
     
     Returns:
         Dictionary containing PSNR, SSIM, and LPIPS scores
     """
+    # Ensure images have same dimensions
+    if original.shape != compared.shape:
+        compared = cv2.resize(compared, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_CUBIC)
+    
     # Convert images to float32
     original = original.astype(np.float32) / 255.0
-    upscaled = upscaled.astype(np.float32) / 255.0
+    compared = compared.astype(np.float32) / 255.0
     
     # Calculate PSNR
-    psnr_value = psnr(original, upscaled, data_range=1.0)
+    psnr_value = psnr(original, compared, data_range=1.0)
     
     # Calculate SSIM
-    ssim_value = ssim(original, upscaled, channel_axis=2, data_range=1.0)
+    ssim_value = ssim(original, compared, channel_axis=2, data_range=1.0)
     
     # Calculate LPIPS
     # Convert images to torch tensors
     original_tensor = torch.from_numpy(original).permute(2, 0, 1).unsqueeze(0).to(device)
-    upscaled_tensor = torch.from_numpy(upscaled).permute(2, 0, 1).unsqueeze(0).to(device)
+    compared_tensor = torch.from_numpy(compared).permute(2, 0, 1).unsqueeze(0).to(device)
     
     # Initialize LPIPS model
     lpips_model = lpips.LPIPS(net='alex').to(device)
     
     # Calculate LPIPS
     with torch.no_grad():
-        lpips_value = lpips_model(original_tensor, upscaled_tensor).item()
+        lpips_value = lpips_model(original_tensor, compared_tensor).item()
     
     return {
         'psnr': psnr_value,
@@ -57,15 +61,16 @@ def calculate_metrics(original, upscaled, device='cpu'):
     }
 
 
-def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_threads=0, metrics_interval=30):
+def upscale_video_onnx(lr_video_path, hr_video_path, output_path, onnx_model_path, scale=4, num_threads=0, metrics_interval=30):
     """
-    Upscale a video using ONNX Runtime inference
+    Upscale a low-resolution video and compare with a high-resolution ground truth
     
     Args:
-        video_path: Path to the input video
+        lr_video_path: Path to the low-resolution input video
+        hr_video_path: Path to the high-resolution ground truth video
         output_path: Path to save the output video
         onnx_model_path: Path to the ONNX model
-        scale: Upscaling factor
+        scale: Upscaling factor (default is 4 for evaluation)
         num_threads: Number of threads for ONNX Runtime (0 means default)
         metrics_interval: Calculate metrics every N frames
     """
@@ -85,28 +90,30 @@ def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_thre
     # Get model input name
     input_name = session.get_inputs()[0].name
     
-    # Open the video file
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Could not open video file {video_path}")
+    # Open both video files
+    lr_cap = cv2.VideoCapture(lr_video_path)
+    hr_cap = cv2.VideoCapture(hr_video_path)
+    
+    if not lr_cap.isOpened() or not hr_cap.isOpened():
+        print(f"Error: Could not open video files")
         return
     
     # Get video properties
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    lr_frame_count = int(lr_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    hr_frame_count = int(hr_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_count = min(lr_frame_count, hr_frame_count)  # Use the shorter video length
     
-    # Calculate new dimensions
-    new_width = width * scale
-    new_height = height * scale
+    fps = lr_cap.get(cv2.CAP_PROP_FPS)
+    lr_width = int(lr_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    lr_height = int(lr_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    hr_width = int(hr_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    hr_height = int(hr_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Initialize metrics
-    metrics = {
-        'psnr': [],
-        'ssim': [],
-        'lpips': []
-    }
+    # Verify resolution relationship
+    if hr_width != lr_width * scale or hr_height != lr_height * scale:
+        print(f"Error: Resolution mismatch. Expected HR to be {scale}x of LR")
+        print(f"LR: {lr_width}x{lr_height}, HR: {hr_width}x{hr_height}")
+        return
     
     # Create a temporary directory for processing
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -115,21 +122,39 @@ def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_thre
         
         # Create VideoWriter object
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(video_no_audio_path, fourcc, fps, (new_width, new_height))
+        out = cv2.VideoWriter(video_no_audio_path, fourcc, fps, (hr_width, hr_height))
+        
+        # Initialize metrics dictionaries
+        metrics_sr = {  # Super-resolution vs High-res
+            'psnr': [],
+            'ssim': [],
+            'lpips': []
+        }
+        metrics_nn = {  # Nearest-neighbor upscaled vs High-res
+            'psnr': [],
+            'ssim': [],
+            'lpips': []
+        }
         
         # Process each frame
         start_time = time.time()
         
         for frame_idx in tqdm(range(frame_count), desc="Processing frames"):
-            ret, frame = cap.read()
-            if not ret:
+            # Read frames from both videos
+            lr_ret, lr_frame = lr_cap.read()
+            hr_ret, hr_frame = hr_cap.read()
+            
+            if not lr_ret or not hr_ret:
                 break
             
-            # Convert BGR to RGB (OpenCV uses BGR by default)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Store high-res frame for metrics
+            hr_frame_rgb = cv2.cvtColor(hr_frame, cv2.COLOR_BGR2RGB)
             
-            # Preprocess the frame
-            lr, _ = preprocess(frame_rgb, 'cpu')
+            # Convert low-res frame to RGB
+            lr_frame_rgb = cv2.cvtColor(lr_frame, cv2.COLOR_BGR2RGB)
+            
+            # Preprocess the low-res frame
+            lr, _ = preprocess(lr_frame_rgb, 'cpu')
             
             # Convert to numpy and ensure correct shape for ONNX
             lr_np = lr.cpu().numpy()
@@ -141,61 +166,71 @@ def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_thre
             # Convert back to image
             preds = preds.squeeze(0).squeeze(0) * 255.0
             
-            # Get the bicubic upscaled frame for color information
-            bicubic = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-            bicubic_rgb = cv2.cvtColor(bicubic, cv2.COLOR_BGR2RGB)
-            _, ycbcr = preprocess(bicubic_rgb, 'cpu')
+            # Get the nearest-neighbor upscaled frame for color information
+            nearest = cv2.resize(lr_frame, (hr_width, hr_height), interpolation=cv2.INTER_NEAREST)
+            nearest_rgb = cv2.cvtColor(nearest, cv2.COLOR_BGR2RGB)
+            _, ycbcr = preprocess(nearest_rgb, 'cpu')
             
             # Combine the FSRCNN Y channel with the bicubic Cb and Cr channels
             output = np.array([preds, ycbcr[..., 1], ycbcr[..., 2]]).transpose([1, 2, 0])
             output = np.clip(convert_ycbcr_to_rgb(output), 0.0, 255.0).astype(np.uint8)
+            
+            # Calculate metrics at specified intervals
+            if frame_idx % metrics_interval == 0:
+                # Calculate metrics between high-res and super-resolution result
+                sr_metrics = calculate_metrics(hr_frame_rgb, output)
+                
+                # Calculate metrics between high-res and nearest-neighbor upscaled
+                nn_metrics = calculate_metrics(hr_frame_rgb, nearest_rgb)
+                
+                # Store metrics
+                for key in metrics_sr.keys():
+                    metrics_sr[key].append(sr_metrics[key])
+                    metrics_nn[key].append(nn_metrics[key])
+                
+                # Print metrics for this frame
+                print(f"\nFrame {frame_idx} metrics:")
+                print("Super-resolution vs High-res:")
+                print(f"PSNR: {sr_metrics['psnr']:.2f} dB")
+                print(f"SSIM: {sr_metrics['ssim']:.4f}")
+                print(f"LPIPS: {sr_metrics['lpips']:.4f}")
+                print("\nNearest-neighbor upscaled vs High-res:")
+                print(f"PSNR: {nn_metrics['psnr']:.2f} dB")
+                print(f"SSIM: {nn_metrics['ssim']:.4f}")
+                print(f"LPIPS: {nn_metrics['lpips']:.4f}")
             
             # Convert RGB back to BGR for OpenCV
             output_bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
             
             # Write the frame to the output video
             out.write(output_bgr)
-            
-            # Calculate metrics at specified intervals
-            if frame_idx % metrics_interval == 0:
-                # Get the ground truth frame (bicubic upscaled)
-                gt_frame = cv2.resize(frame_rgb, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-                
-                # Calculate metrics
-                frame_metrics = calculate_metrics(gt_frame, output)
-                
-                # Store metrics
-                metrics['psnr'].append(frame_metrics['psnr'])
-                metrics['ssim'].append(frame_metrics['ssim'])
-                metrics['lpips'].append(frame_metrics['lpips'])
-                
-                # Print metrics for this frame
-                print(f"\nFrame {frame_idx} metrics:")
-                print(f"PSNR: {frame_metrics['psnr']:.2f} dB")
-                print(f"SSIM: {frame_metrics['ssim']:.4f}")
-                print(f"LPIPS: {frame_metrics['lpips']:.4f}")
         
         # Release resources
-        cap.release()
+        lr_cap.release()
+        hr_cap.release()
         out.release()
         
         # Calculate and print average metrics
-        if metrics['psnr']:
+        if metrics_sr['psnr']:
             print("\nAverage metrics across sampled frames:")
-            print(f"PSNR: {np.mean(metrics['psnr']):.2f} dB")
-            print(f"SSIM: {np.mean(metrics['ssim']):.4f}")
-            print(f"LPIPS: {np.mean(metrics['lpips']):.4f}")
+            print("\nSuper-resolution vs High-res:")
+            print(f"PSNR: {np.mean(metrics_sr['psnr']):.2f} dB")
+            print(f"SSIM: {np.mean(metrics_sr['ssim']):.4f}")
+            print(f"LPIPS: {np.mean(metrics_sr['lpips']):.4f}")
+            print("\nNearest-neighbor upscaled vs High-res:")
+            print(f"PSNR: {np.mean(metrics_nn['psnr']):.2f} dB")
+            print(f"SSIM: {np.mean(metrics_nn['ssim']):.4f}")
+            print(f"LPIPS: {np.mean(metrics_nn['lpips']):.4f}")
         
-        # Copy audio from original video to the upscaled video
-        print("\nCopying audio from original video to upscaled video...")
+        # Copy audio from low-res video to the upscaled video
+        print("\nCopying audio from low-res video to upscaled video...")
         
-        # Check if ffmpeg is available
         try:
-            # Command to copy audio from original to upscaled video
+            # Command to copy audio from low-res to upscaled video
             cmd = [
                 'ffmpeg',
                 '-i', video_no_audio_path,  # Input video without audio
-                '-i', video_path,           # Original video with audio
+                '-i', lr_video_path,        # Low-res video with audio
                 '-c:v', 'copy',             # Copy video stream
                 '-c:a', 'aac',              # Audio codec
                 '-map', '0:v:0',            # Map video from first input
@@ -274,9 +309,10 @@ if __name__ == '__main__':
     # Single video upscaling command
     single_parser = subparsers.add_parser('single', help='Upscale a single video')
     single_parser.add_argument('--onnx-model', type=str, required=True, help='Path to the ONNX model file')
-    single_parser.add_argument('--video-file', type=str, required=True, help='Path to the input video file')
+    single_parser.add_argument('--lr-video', type=str, required=True, help='Path to the low-resolution input video file')
+    single_parser.add_argument('--hr-video', type=str, required=True, help='Path to the high-resolution ground truth video file')
     single_parser.add_argument('--output-file', type=str, required=True, help='Path to save the output video')
-    single_parser.add_argument('--scale', type=int, default=3, help='Upscaling factor (2, 3, or 4)')
+    single_parser.add_argument('--scale', type=int, default=4, help='Upscaling factor (default is 4)')
     single_parser.add_argument('--num-threads', type=int, default=0, help='Number of threads for ONNX Runtime (0 means default)')
     single_parser.add_argument('--metrics-interval', type=int, default=30, help='Calculate metrics every N frames')
     
@@ -292,7 +328,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     if args.command == 'single':
-        upscale_video_onnx(args.video_file, args.output_file, args.onnx_model, args.scale, args.num_threads, args.metrics_interval)
+        upscale_video_onnx(args.lr_video, args.hr_video, args.output_file, args.onnx_model, args.scale, args.num_threads, args.metrics_interval)
     elif args.command == 'batch':
         batch_upscale_videos_onnx(args.input_dir, args.output_dir, args.onnx_model, args.scale, args.num_threads, args.metrics_interval)
     else:
