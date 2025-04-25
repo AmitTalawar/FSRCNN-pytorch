@@ -10,3 +10,5 @@ onnx
 onnxruntime
 matplotlib
 ffmpeg-python
+scikit-image
+lpips

@@ -7,11 +7,57 @@ import onnxruntime as ort
 from tqdm import tqdm
 import tempfile
 import subprocess
+import torch
+import torch.nn.functional as F
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+import lpips
 
 from utils import convert_ycbcr_to_rgb, preprocess
 
 
-def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_threads=0):
+def calculate_metrics(original, upscaled, device='cpu'):
+    """
+    Calculate image quality metrics between original and upscaled images
+    
+    Args:
+        original: Original image (numpy array)
+        upscaled: Upscaled image (numpy array)
+        device: Device to run LPIPS on
+    
+    Returns:
+        Dictionary containing PSNR, SSIM, and LPIPS scores
+    """
+    # Convert images to float32
+    original = original.astype(np.float32) / 255.0
+    upscaled = upscaled.astype(np.float32) / 255.0
+    
+    # Calculate PSNR
+    psnr_value = psnr(original, upscaled, data_range=1.0)
+    
+    # Calculate SSIM
+    ssim_value = ssim(original, upscaled, channel_axis=2, data_range=1.0)
+    
+    # Calculate LPIPS
+    # Convert images to torch tensors
+    original_tensor = torch.from_numpy(original).permute(2, 0, 1).unsqueeze(0).to(device)
+    upscaled_tensor = torch.from_numpy(upscaled).permute(2, 0, 1).unsqueeze(0).to(device)
+    
+    # Initialize LPIPS model
+    lpips_model = lpips.LPIPS(net='alex').to(device)
+    
+    # Calculate LPIPS
+    with torch.no_grad():
+        lpips_value = lpips_model(original_tensor, upscaled_tensor).item()
+    
+    return {
+        'psnr': psnr_value,
+        'ssim': ssim_value,
+        'lpips': lpips_value
+    }
+
+
+def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_threads=0, metrics_interval=30):
     """
     Upscale a video using ONNX Runtime inference
     
@@ -21,6 +67,7 @@ def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_thre
         onnx_model_path: Path to the ONNX model
         scale: Upscaling factor
         num_threads: Number of threads for ONNX Runtime (0 means default)
+        metrics_interval: Calculate metrics every N frames
     """
     # Create ONNX Runtime session
     print(f"Loading ONNX model from {onnx_model_path}")
@@ -54,6 +101,13 @@ def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_thre
     new_width = width * scale
     new_height = height * scale
     
+    # Initialize metrics
+    metrics = {
+        'psnr': [],
+        'ssim': [],
+        'lpips': []
+    }
+    
     # Create a temporary directory for processing
     with tempfile.TemporaryDirectory() as temp_dir:
         # Path for the video without audio
@@ -66,7 +120,7 @@ def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_thre
         # Process each frame
         start_time = time.time()
         
-        for _ in tqdm(range(frame_count), desc="Processing frames"):
+        for frame_idx in tqdm(range(frame_count), desc="Processing frames"):
             ret, frame = cap.read()
             if not ret:
                 break
@@ -101,13 +155,39 @@ def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_thre
             
             # Write the frame to the output video
             out.write(output_bgr)
+            
+            # Calculate metrics at specified intervals
+            if frame_idx % metrics_interval == 0:
+                # Get the ground truth frame (bicubic upscaled)
+                gt_frame = cv2.resize(frame_rgb, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+                
+                # Calculate metrics
+                frame_metrics = calculate_metrics(gt_frame, output)
+                
+                # Store metrics
+                metrics['psnr'].append(frame_metrics['psnr'])
+                metrics['ssim'].append(frame_metrics['ssim'])
+                metrics['lpips'].append(frame_metrics['lpips'])
+                
+                # Print metrics for this frame
+                print(f"\nFrame {frame_idx} metrics:")
+                print(f"PSNR: {frame_metrics['psnr']:.2f} dB")
+                print(f"SSIM: {frame_metrics['ssim']:.4f}")
+                print(f"LPIPS: {frame_metrics['lpips']:.4f}")
         
         # Release resources
         cap.release()
         out.release()
         
+        # Calculate and print average metrics
+        if metrics['psnr']:
+            print("\nAverage metrics across sampled frames:")
+            print(f"PSNR: {np.mean(metrics['psnr']):.2f} dB")
+            print(f"SSIM: {np.mean(metrics['ssim']):.4f}")
+            print(f"LPIPS: {np.mean(metrics['lpips']):.4f}")
+        
         # Copy audio from original video to the upscaled video
-        print("Copying audio from original video to upscaled video...")
+        print("\nCopying audio from original video to upscaled video...")
         
         # Check if ffmpeg is available
         try:
@@ -136,11 +216,11 @@ def upscale_video_onnx(video_path, output_path, onnx_model_path, scale, num_thre
             shutil.copy2(video_no_audio_path, output_path)
     
     elapsed_time = time.time() - start_time
-    print(f"Video processing completed in {elapsed_time:.2f} seconds")
+    print(f"\nVideo processing completed in {elapsed_time:.2f} seconds")
     print(f"Output saved to {output_path}")
 
 
-def batch_upscale_videos_onnx(input_dir, output_dir, onnx_model_path, scale, num_threads=0, extensions=('.mp4', '.avi', '.mkv', '.mov')):
+def batch_upscale_videos_onnx(input_dir, output_dir, onnx_model_path, scale, num_threads=0, metrics_interval=30, extensions=('.mp4', '.avi', '.mkv', '.mov')):
     """
     Process all videos in a directory using ONNX Runtime
     
@@ -150,6 +230,7 @@ def batch_upscale_videos_onnx(input_dir, output_dir, onnx_model_path, scale, num
         onnx_model_path: Path to the ONNX model
         scale: Upscaling factor
         num_threads: Number of threads for ONNX Runtime (0 means default)
+        metrics_interval: Calculate metrics every N frames
         extensions: Tuple of valid video file extensions
     """
     # Create output directory if it doesn't exist
@@ -179,7 +260,7 @@ def batch_upscale_videos_onnx(input_dir, output_dir, onnx_model_path, scale, num
         output_path = os.path.join(output_dir, output_filename)
         
         print(f"\nProcessing: {video_file}")
-        upscale_video_onnx(input_path, output_path, onnx_model_path, scale, num_threads)
+        upscale_video_onnx(input_path, output_path, onnx_model_path, scale, num_threads, metrics_interval)
     
     total_time = time.time() - start_time
     print(f"\nAll videos processed in {total_time:.2f} seconds")
@@ -197,6 +278,7 @@ if __name__ == '__main__':
     single_parser.add_argument('--output-file', type=str, required=True, help='Path to save the output video')
     single_parser.add_argument('--scale', type=int, default=3, help='Upscaling factor (2, 3, or 4)')
     single_parser.add_argument('--num-threads', type=int, default=0, help='Number of threads for ONNX Runtime (0 means default)')
+    single_parser.add_argument('--metrics-interval', type=int, default=30, help='Calculate metrics every N frames')
     
     # Batch video upscaling command
     batch_parser = subparsers.add_parser('batch', help='Upscale multiple videos in a directory')
@@ -205,12 +287,13 @@ if __name__ == '__main__':
     batch_parser.add_argument('--output-dir', type=str, required=True, help='Directory to save output videos')
     batch_parser.add_argument('--scale', type=int, default=3, help='Upscaling factor (2, 3, or 4)')
     batch_parser.add_argument('--num-threads', type=int, default=0, help='Number of threads for ONNX Runtime (0 means default)')
+    batch_parser.add_argument('--metrics-interval', type=int, default=30, help='Calculate metrics every N frames')
     
     args = parser.parse_args()
     
     if args.command == 'single':
-        upscale_video_onnx(args.video_file, args.output_file, args.onnx_model, args.scale, args.num_threads)
+        upscale_video_onnx(args.video_file, args.output_file, args.onnx_model, args.scale, args.num_threads, args.metrics_interval)
     elif args.command == 'batch':
-        batch_upscale_videos_onnx(args.input_dir, args.output_dir, args.onnx_model, args.scale, args.num_threads)
+        batch_upscale_videos_onnx(args.input_dir, args.output_dir, args.onnx_model, args.scale, args.num_threads, args.metrics_interval)
     else:
         parser.print_help() 
